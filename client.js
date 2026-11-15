@@ -44,6 +44,7 @@ window.__ModuleLoader__.load({
       'error.download': 'Could not start the download. Reload the page and retry.',
     }
 
+    /** One stylesheet for both controls, owned by the plugin's own lifetime. */
     const css = [
       '.dshfd-tool{display:inline-flex;flex:none;align-items:center;justify-content:center;',
       'width:28px;height:28px;padding:6px;color:var(--dsw-alias-label-secondary);line-height:1;',
@@ -60,11 +61,6 @@ window.__ModuleLoader__.load({
       '@media (hover:hover){.dshfd-start:hover{background:var(--dsw-alias-button-primary-hover)}}',
     ].join('')
 
-    /** Component-local stylesheet; unmounting removes it with the control. */
-    function Style() {
-      return h('style', { 'data-file-download': '' }, css)
-    }
-
     /** Download glyph: an arrow into a tray, drawn with the current text color. */
     function Glyph() {
       return h('svg', {
@@ -78,12 +74,15 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * The last path segment, used as the saved file name.
+     * The last path segment. A POSIX name may contain a backslash, so it only
+     * counts as a separator when the path is a Windows one.
      * @param path - absolute Host path.
-     * @returns the basename in either separator spelling.
+     * @returns the basename.
      */
     function fileNameOf(path) {
-      const at = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+      const windows = /^[A-Za-z]:[\\/]/u.test(path) || path.startsWith('\\\\')
+      let at = path.lastIndexOf('/')
+      if (windows) at = Math.max(at, path.lastIndexOf('\\'))
       return at < 0 ? path : path.slice(at + 1)
     }
 
@@ -140,33 +139,34 @@ window.__ModuleLoader__.load({
     function DownloadTool(props) {
       const { t, absolutePath, save } = props
       if (absolutePath === undefined) return null
-      return h(React.Fragment, null,
-        h(Style, { key: 'style' }),
-        h('button', {
-          key: 'button', type: 'button', className: 'dshfd-tool', 'data-file-download-tool': '',
-          'aria-label': t('action.download'), title: t('action.download'),
-          onClick: () => { save(absolutePath) },
-        }, h(Glyph)),
-      )
+      return h('button', {
+        type: 'button', className: 'dshfd-tool', 'data-file-download-tool': '',
+        'aria-label': t('action.download'), title: t('action.download'),
+        onClick: () => { save(absolutePath) },
+      }, h(Glyph))
     }
 
     /** Empty-state control: the labelled primary action of an unviewable file. */
     function DownloadStart(props) {
       const { t, absolutePath, save } = props
       if (absolutePath === undefined) return null
-      return h(React.Fragment, null,
-        h(Style, { key: 'style' }),
-        h('button', {
-          key: 'button', type: 'button', className: 'dshfd-start', 'data-file-download-start': '',
-          onClick: () => { save(absolutePath) },
-        }, h(Glyph), h('span', null, t('action.downloadFile'))),
-      )
+      return h('button', {
+        type: 'button', className: 'dshfd-start', 'data-file-download-start': '',
+        onClick: () => { save(absolutePath) },
+      }, h(Glyph), h('span', null, t('action.downloadFile')))
     }
 
     const inject = []
 
     /** @param ctx - plugin-owned Client context. */
     function apply(ctx) {
+      ctx.effect(() => {
+        const style = document.createElement('style')
+        style.dataset.fileDownload = ''
+        style.textContent = css
+        document.head.append(style)
+        return () => { style.remove() }
+      }, 'file-download: styles')
       ctx.inject(['slots', 'locale', 'contextMenus'], (child) => {
         child.effect(() => child.locale.register(NS, { zh, en }), 'file-download: locale')
         const t = child.locale.bind(NS)
