@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Descarga de archivos",
+    "description": "Descarga el archivo que muestra la vista previa lateral: botón en la cabecera y botón en el estado vacío de un archivo no previsualizable. Flujo sin límite de tamaño y con reanudación.",
+    "detail": "docs/DETAIL.md"
+  }
+}

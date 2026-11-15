@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Download de arquivos",
+    "description": "Baixa o arquivo exibido na pré-visualização lateral: botão no cabeçalho e botão no estado vazio de arquivos não visualizáveis. Transferência em fluxo sem limite de tamanho e com retomada.",
+    "detail": "docs/DETAIL.md"
+  }
+}

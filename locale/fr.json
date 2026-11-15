@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Téléchargement de fichiers",
+    "description": "Télécharge le fichier affiché dans l'aperçu latéral : bouton dans l'en-tête et bouton dans l'état vide d'un fichier non prévisualisable. Flux sans limite de taille et reprise prise en charge.",
+    "detail": "docs/DETAIL.md"
+  }
+}
