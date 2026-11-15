@@ -1,0 +1,5 @@
+# Host half of dsh-file-download: the Client half owns the controls, so the Host
+# row exists only to publish the package into the client module graph.
+- insert:
+    - id: file-download
+      name: 'dsh-file-download'
