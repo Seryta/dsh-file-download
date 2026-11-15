@@ -21,7 +21,8 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node test/route.test.mjs"
+    "test": "node test/route.test.mjs",
+    "test:mutation": "node scripts/mutation-check.mjs"
   },
   "license": "MIT",
   "dsh": {
