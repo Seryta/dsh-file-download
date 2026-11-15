@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Dateidownload",
+    "description": "Lädt die in der Seitenvorschau angezeigte Datei herunter: Kopfzeilen-Schaltfläche und Schaltfläche im Leerzustand nicht darstellbarer Dateien. Streaming ohne Größenlimit und mit Fortsetzung.",
+    "detail": "docs/DETAIL.md"
+  }
+}
