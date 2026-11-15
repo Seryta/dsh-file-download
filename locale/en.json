@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "File download",
+    "description": "Download the file a Sidebar preview is showing, from the preview header or an unviewable file's empty state.",
+    "detail": "docs/DETAIL.md"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "文件下载",
+    "description": "在右侧预览面板中直接下载当前文件：标题栏按钮，以及无法预览文件的空状态按钮。",
+    "detail": "docs/DETAIL.md"
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "name": "dsh-file-download",
+  "version": "1.2.0",
+  "description": "在 DSH Web 的右侧预览面板里直接下载当前文件：标题栏按钮 + 空状态按钮，流式无上限、支持断点续传。",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale",
+    "docs",
+    "icon.svg",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node test/route.test.mjs"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-context-menu",
+        "@deepseek-ai/dsh-api-workspace-files",
+        "@deepseek-ai/dsh-client-ui-sidebar-documentpreview"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=22.6.0",
+    "dsh": ">=0.2.0-rc.1 <0.3.0"
+  },
+  "author": "Saryta",
+  "homepage": "https://github.com/Seryta/dsh-file-download#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Seryta/dsh-file-download.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Seryta/dsh-file-download/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "download",
+    "resume",
+    "range",
+    "apk",
+    "preview"
+  ]
+}
