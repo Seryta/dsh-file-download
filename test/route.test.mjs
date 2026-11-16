@@ -3,7 +3,7 @@
 // assert the HTTP contract the browser and the shipped routes depend on.
 import { createHash, randomBytes } from 'node:crypto'
 import { Buffer } from 'node:buffer'
-import { closeSync, fstatSync, mkdirSync, mkdtempSync, openSync, readSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, fstatSync, mkdirSync, mkdtempSync, openSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../index.js'
@@ -129,10 +129,17 @@ const request = (path, { method = 'GET', headers = {}, signal } = {}) => new Req
 )
 const md5 = (bytes) => createHash('md5').update(Buffer.from(bytes)).digest('hex')
 const expected = md5(bigBytes)
-const settle = async (promise, ms = 3000) => Promise.race([
-  promise.then(() => 'settled', () => 'settled'),
-  new Promise(resolve => setTimeout(() => resolve('timeout'), ms)),
-])
+const settle = async (promise, ms = 3000) => {
+  let timer
+  try {
+    return await Promise.race([
+      promise.then(() => 'resolved', () => 'rejected'),
+      new Promise(resolve => { timer = setTimeout(() => resolve('timeout'), ms) }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
 
 // 1. complete file streams in bounded windows
 {
@@ -305,7 +312,7 @@ const settle = async (promise, ms = 3000) => Promise.race([
   const route = handlerWith(fakeFs({ failWindow: 2 }))
   const response = await route.fetch(request(bigPath))
   const outcome = await settle(response.arrayBuffer())
-  check('mid-stream read failure: response settles', outcome === 'settled', outcome)
+  check('mid-stream read failure: response rejects', outcome === 'rejected', outcome)
 }
 
 // 14. a file replaced mid-download can never mix versions into one body
@@ -360,6 +367,284 @@ const settle = async (promise, ms = 3000) => Promise.race([
   const response = await handlerWith(fakeFs()).fetch(request(path, { method: 'HEAD' }))
   const value = response.headers.get('content-disposition')
   check('filename*: special characters are percent-encoded', value?.includes("filename*=UTF-8''O%27Reilly%28%E4%B8%AD%E6%96%87%29%2A.pdf") === true, value)
+}
+
+// 19. Unknown-size providers have the same first-read failure contract.
+{
+  for (const [code, status] of [['FS_PERMISSION_DENIED', 403], ['FS_NOT_FOUND', 404], ['FS_ABORTED', 499]]) {
+    const fs = fakeFs({ withSize: false, failWindow: 0, failCode: code })
+    const outcome = await handlerWith(fs).fetch(request(bigPath)).then(r => r.status, e => e.name)
+    check(`unknown size first read ${code}: HTTP ${status}`, outcome === status, String(outcome))
+  }
+}
+
+// 20. EOF is data too: validate its version before closing an unbounded body.
+{
+  const fs = fakeFs({ withSize: false })
+  const read = fs.readByteRange.bind(fs)
+  fs.readByteRange = async (...args) => {
+    if (args[1].offset >= 4 * 1024 * 1024) {
+      fs.state.version = 'truncated'
+      return new Uint8Array()
+    }
+    return read(...args)
+  }
+  const response = await handlerWith(fs).fetch(request(bigPath))
+  const outcome = await settle(response.arrayBuffer())
+  check('unknown size changed at EOF: rejects instead of succeeding with a prefix', outcome === 'rejected', outcome)
+}
+
+// 21. A zero-length read before a declared end is not a successful completion.
+{
+  const fs = fakeFs()
+  const read = fs.readByteRange.bind(fs)
+  fs.readByteRange = async (...args) => args[1].offset >= 4 * 1024 * 1024 ? new Uint8Array() : read(...args)
+  const response = await handlerWith(fs).fetch(request(bigPath))
+  const outcome = await settle(response.arrayBuffer())
+  check('premature EOF: rejects even if a provider keeps its version token', outcome === 'rejected', outcome)
+}
+
+// 22. Capability discovery needs a positive marker, including on the pathless probe.
+{
+  const route = handlerWith(fakeFs())
+  const response = await route.fetch(new Request('http://dsh.internal/api/file-download', { method: 'HEAD' }))
+  check('capability: pathless HEAD carries the route marker', response.status === 400 && response.headers.get('x-dsh-file-download') === '1')
+}
+
+/** Local-provider shape, with genuine inode and freshness metadata. */
+function localFs() {
+  const fallback = fakeFs()
+  return {
+    ...fallback,
+    async resolve(path) { return { targetKey: realpathSync(path), displayPath: path } },
+    processPath(target) { return target.targetKey },
+    processPathFromHostPath(path) { return path },
+    async stat(target) {
+      const info = statSync(target.targetKey, { bigint: true })
+      return { type: info.isFile() ? 'file' : 'directory', version: `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`, size: Number(info.size) }
+    },
+  }
+}
+
+// 23. Reversibly switching the containing directory defeats a path-only stat.
+{
+  const home = join(root, 'live')
+  const other = join(root, 'other')
+  const parked = join(root, 'parked')
+  mkdirSync(home)
+  mkdirSync(other)
+  const path = join(home, 'payload.bin')
+  const original = Buffer.alloc(8 * 1024 * 1024, 0xaa)
+  writeFileSync(path, original)
+  writeFileSync(join(other, 'payload.bin'), Buffer.alloc(original.length, 0x55))
+  const fs = localFs()
+  const stat = fs.stat.bind(fs)
+  let checks = 0
+  let switched = false
+  let restored = false
+  fs.stat = async target => {
+    checks += 1
+    if (checks === 3) {
+      renameSync(home, other)
+      renameSync(parked, home)
+      restored = true
+    }
+    const info = await stat(target)
+    if (checks === 2) {
+      renameSync(home, parked)
+      renameSync(other, home)
+      switched = true
+    }
+    return info
+  }
+  const response = await handlerWith(fs).fetch(request(path))
+  const result = await response.arrayBuffer().then(bytes => Buffer.from(bytes), () => undefined)
+  check('directory rollback: fixture really switched and restored the directory', switched && restored)
+  check('directory rollback: never succeeds with mixed bytes', response.status >= 400 || result === undefined || result.equals(original), result === undefined ? 'rejected' : md5(result))
+}
+
+// 24. A native handle must remain bounded and close on normal completion/cancel/abort.
+if (process.platform === 'linux') {
+  const count = () => readdirSync('/proc/self/fd').length
+  const before = count()
+  await (await handlerWith(localFs()).fetch(request(bigPath))).arrayBuffer()
+  check('local reader: completion closes its handle', count() === before, `${before} -> ${count()}`)
+  const cancelled = await handlerWith(localFs()).fetch(request(bigPath))
+  await cancelled.body.cancel()
+  check('local reader: cancellation closes its handle', count() === before, `${before} -> ${count()}`)
+  const controller = new AbortController()
+  const aborted = await handlerWith(localFs()).fetch(request(bigPath, { signal: controller.signal }))
+  controller.abort()
+  await aborted.body.cancel()
+  check('local reader: abort closes its handle', count() === before, `${before} -> ${count()}`)
+}
+
+// 25. Host path sharing must not bypass a provider's independent read policy.
+{
+  const fs = localFs()
+  fs.readByteRange = async () => { throw Object.assign(new Error('policy denied'), { code: 'FS_SANDBOX_DENIED' }) }
+  const response = await handlerWith(fs).fetch(request(bigPath))
+  check('local reader: provider read policy still answers 403', response.status === 403, String(response.status))
+}
+
+// 26. A process path without a same-host mapping must never be opened on this host.
+{
+  const fs = fakeFs()
+  fs.processPath = () => '/not-a-shared-host-file.bin'
+  fs.processPathFromHostPath = () => undefined
+  const response = await handlerWith(fs).fetch(request(bigPath))
+  const bytes = new Uint8Array(await response.arrayBuffer())
+  check('remote provider: no unproven host open', response.status === 200 && md5(bytes) === expected)
+}
+
+// 27. An ABA change inside a provider read must disagree with the pinned fd.
+{
+  const live = join(root, 'window-live')
+  const other = join(root, 'window-other')
+  const parked = join(root, 'window-parked')
+  mkdirSync(live)
+  mkdirSync(other)
+  const path = join(live, 'payload.bin')
+  const original = Buffer.alloc(8 * 1024 * 1024, 0xaa)
+  writeFileSync(path, original)
+  writeFileSync(join(other, 'payload.bin'), Buffer.alloc(original.length, 0x55))
+  const fs = localFs()
+  const read = fs.readByteRange.bind(fs)
+  let swapped = false
+  fs.readByteRange = async (target, range, signal) => {
+    if (range.offset !== 4 * 1024 * 1024 || swapped) return read(target, range, signal)
+    renameSync(live, parked)
+    renameSync(other, live)
+    try {
+      const bytes = await read(target, range, signal)
+      swapped = true
+      return bytes
+    } finally {
+      renameSync(live, other)
+      renameSync(parked, live)
+    }
+  }
+  const response = await handlerWith(fs).fetch(request(path))
+  const result = await response.arrayBuffer().then(bytes => Buffer.from(bytes), () => undefined)
+  check('local provider ABA: change actually occurred within the read', swapped)
+  check('local provider ABA: mismatched pinned bytes reject the body', result === undefined, result === undefined ? 'rejected' : md5(result))
+}
+
+// 28. The first opened object, not an earlier path stat, owns the native ETag.
+{
+  const live = join(root, 'open-live')
+  const other = join(root, 'open-other')
+  const parked = join(root, 'open-parked')
+  mkdirSync(live)
+  mkdirSync(other)
+  const path = join(live, 'payload.bin')
+  const original = Buffer.alloc(1024, 0xaa)
+  const replacement = Buffer.alloc(2048, 0x55)
+  writeFileSync(path, original)
+  writeFileSync(join(other, 'payload.bin'), replacement)
+  const oldTag = (await handlerWith(localFs()).fetch(request(path, { method: 'HEAD' }))).headers.get('etag')
+  const fs = localFs()
+  const read = fs.readByteRange.bind(fs)
+  let swapped = false
+  let restored = false
+  fs.processPath = target => {
+    renameSync(live, parked)
+    renameSync(other, live)
+    swapped = true
+    return target.targetKey
+  }
+  fs.readByteRange = async (...args) => {
+    const bytes = await read(...args)
+    if (swapped && !restored) {
+      renameSync(live, other)
+      renameSync(parked, live)
+      restored = true
+    }
+    return bytes
+  }
+  const response = await handlerWith(fs).fetch(request(path))
+  const bytes = Buffer.from(await response.arrayBuffer())
+  check('first-open race: fixture swapped before open and restored after read', swapped && restored)
+  check('first-open race: successful body is the opened object', response.status === 200 && bytes.equals(replacement))
+  check('first-open race: Content-Length belongs to the opened object', response.headers.get('content-length') === String(replacement.length))
+  check('first-open race: replacement never carries the old ETag', response.headers.get('etag') !== oldTag)
+}
+
+// 29. The native ETag is stable across HEAD/GET and supports real ranged assembly.
+{
+  const route = handlerWith(localFs())
+  const tag = (await route.fetch(request(bigPath, { method: 'HEAD' }))).headers.get('etag')
+  const resumed = await route.fetch(request(bigPath, { headers: { range: 'bytes=1048576-', 'if-range': tag } }))
+  const bytes = new Uint8Array(await resumed.arrayBuffer())
+  check('local resume: stable validator and correct ranged bytes', resumed.status === 206 && resumed.headers.get('etag') === tag && md5(bytes) === md5(bigBytes.subarray(1048576)))
+}
+
+// 30. Consumer cancellation must reach an already-running provider read.
+for (const local of [false, true]) {
+  const fs = local ? localFs() : fakeFs()
+  const read = fs.readByteRange.bind(fs)
+  let entered
+  const waiting = new Promise(resolve => { entered = resolve })
+  let cancelled = false
+  fs.readByteRange = async (target, range, signal) => {
+    if (range.offset === 0) return read(target, range, signal)
+    entered()
+    return new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => {
+        cancelled = true
+        reject(Object.assign(new Error('cancelled'), { code: 'FS_ABORTED' }))
+      }, { once: true })
+    })
+  }
+  const response = await handlerWith(fs).fetch(request(bigPath))
+  const reader = response.body.getReader()
+  await reader.read()
+  const next = reader.read()
+  await waiting
+  await reader.cancel()
+  check(`${local ? 'local' : 'abstract'} cancellation: in-flight provider read receives abort`, cancelled)
+  check(`${local ? 'local' : 'abstract'} cancellation: pending consumer ends cleanly`, (await next).done === true)
+}
+
+// 31. Policy may deny a later window; native pinning never bypasses it.
+{
+  const fs = localFs()
+  const read = fs.readByteRange.bind(fs)
+  fs.readByteRange = async (target, range, signal) => {
+    if (range.offset > 0) throw Object.assign(new Error('policy changed'), { code: 'FS_SANDBOX_DENIED' })
+    return read(target, range, signal)
+  }
+  const response = await handlerWith(fs).fetch(request(bigPath))
+  check('local reader: later provider policy denial rejects the body', (await settle(response.arrayBuffer())) === 'rejected')
+}
+
+// 32. Backpressure must not hold the handle after an abort with no more reads.
+if (process.platform === 'linux') {
+  const count = () => readdirSync('/proc/self/fd').length
+  const before = count()
+  const fs = localFs()
+  const stat = fs.stat.bind(fs)
+  let validated
+  const ready = new Promise(resolve => { validated = resolve })
+  let checks = 0
+  fs.stat = async (...args) => {
+    const info = await stat(...args)
+    if (++checks === 3) validated()
+    return info
+  }
+  const controller = new AbortController()
+  const response = await handlerWith(fs).fetch(request(bigPath, { signal: controller.signal }))
+  await ready
+  // The pending first window's final metadata check is complete; let its
+  // enqueue finish so highWaterMark backpressure prevents any further pull.
+  await new Promise(resolve => setImmediate(resolve))
+  check('local idle abort: a pinned handle is held while the queue is full', count() === before + 1)
+  controller.abort()
+  const deadline = Date.now() + 2000
+  while (count() !== before && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5))
+  check('local idle abort: closes without reader.cancel or further consumption', count() === before)
+  // Keep the Response alive until after checking, so GC cannot provide cleanup.
+  check('local idle abort: response remained unconsumed', response.body.locked === false)
 }
 
 rmSync(root, { recursive: true, force: true })

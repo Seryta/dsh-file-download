@@ -6,11 +6,11 @@
  * performs the transfer — no client memory, no size cap, real progress, and
  * resume through `Range` plus a per-version `ETag` / `If-Range` validator.
  *
- * One response carries one file version: the first window is read before any
- * header is written (so an unreadable file answers 403/404 instead of a 200 that
- * fails mid-body), and every window is validated against the version the headers
- * describe before it enters the body. A changed file aborts the response, so a
- * client can never assemble bytes from two versions.
+ * The first window is read and validated before any success header is written.
+ * Host-shared files keep one open handle; provider-authorized windows must match
+ * that handle, and its own metadata supplies the response identity. EOF is also
+ * validated. Abstract backends retain their opaque version checks: a stronger
+ * atomic snapshot guarantee requires support in the backend's byte-read API.
  *
  * The connection service authenticates the request before this handler runs and
  * supplies `ctx.fs`; paths and media types do not restrict access, exactly like
@@ -18,6 +18,9 @@
  * streams instead of buffering.
  */
 import { createHash } from 'node:crypto'
+import { Buffer } from 'node:buffer'
+import { constants } from 'node:fs'
+import { open } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 
 /** The route this plugin owns. */
@@ -59,6 +62,7 @@ const STATUS_BY_CODE = {
   FS_SANDBOX_DENIED: 403,
   FS_TOO_LARGE: 413,
   FS_ABORTED: 499,
+  FILE_CHANGED: 409,
 }
 
 /** A failed read answered as a plain status instead of an unreadable body. */
@@ -181,58 +185,155 @@ async function readWindow(fs, target, offset, length, signal) {
   }
 }
 
+/** Own metadata from an open local file; this never decodes an opaque FsVersion. */
+function handleVersion(info) {
+  return `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`
+}
+
+/** Convert provider failures and native open/read failures to the same HTTP contract. */
+function readFailure(error) {
+  if (error instanceof ReadFailure) return error
+  const raw = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : ''
+  const code = ({ ENOENT: 'FS_NOT_FOUND', ENOTDIR: 'FS_NOT_FOUND', EACCES: 'FS_PERMISSION_DENIED', EPERM: 'FS_PERMISSION_DENIED' })[raw] ?? raw
+  return new ReadFailure(code)
+}
+
 /**
- * Stream `[start, end)` through validated windows, starting from one already read.
- * @param fs - composed filesystem that owns read authority.
- * @param target - resolved file target.
- * @param start - 0-based first byte.
- * @param end - exclusive last byte.
- * @param expected - entity tag the response headers describe.
- * @param first - the pre-read first window.
- * @param signal - aborts the stream when the client goes away.
- * @param log - optional Host logger for aborted transfers.
- * @returns the response body.
+ * One request owns one reader and its close promise. Host-shared files are pinned
+ * to a handle; all byte ranges still go through the provider's read authority.
+ * Their bytes must match the pinned object before entering the response.
+ * Providers without a host mapping retain the abstract window/version protocol.
  */
-function bodyOf(fs, target, start, end, expected, first, signal, log) {
+async function openReader(fs, target, info, signal, log) {
+  const expected = tagOf(info)
+  const check = async () => {
+    if (signal.aborted) throw new ReadFailure('FS_ABORTED')
+    const current = await fs.stat(target, signal)
+    if (signal.aborted) throw new ReadFailure('FS_ABORTED')
+    if (current === undefined || tagOf(current) !== expected) throw new ReadFailure('FILE_CHANGED')
+  }
+  const reader = {
+    info,
+    check,
+    close: async () => {},
+    async read(offset, length) {
+      const bytes = await readWindow(fs, target, offset, length, signal)
+      // Even an empty window is checked: EOF may have come from a new version.
+      await check()
+      return bytes
+    },
+  }
+  const processPath = fs.processPath?.(target)
+  const hostPath = processPath !== undefined && fs.processPathFromHostPath?.(processPath) === processPath ? processPath : undefined
+  if (hostPath === undefined) return reader
+
+  if (signal.aborted) throw new ReadFailure('FS_ABORTED')
+  // NONBLOCK prevents a file swapped for a FIFO between stat/open from hanging.
+  const handle = await open(hostPath, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0))
+  let closing
+  const close = () => {
+    if (closing === undefined) {
+      signal.removeEventListener('abort', onAbort)
+      closing = handle.close()
+    }
+    return closing
+  }
+  const onAbort = () => { void close().catch(error => { log?.warn(`file-download: close failed: ${String(error)}`) }) }
+  signal.addEventListener('abort', onAbort, { once: true })
+  try {
+    if (signal.aborted) throw new ReadFailure('FS_ABORTED')
+    const opened = await handle.stat({ bigint: true })
+    if (!opened.isFile()) throw new ReadFailure('FS_NOT_REGULAR_FILE')
+    const version = handleVersion(opened)
+    const verifyHandle = async () => {
+      if (signal.aborted) throw new ReadFailure('FS_ABORTED')
+      if (handleVersion(await handle.stat({ bigint: true })) !== version) throw new ReadFailure('FILE_CHANGED')
+    }
+    return {
+      // Headers describe the object actually opened, including the first-open race.
+      info: { ...info, version: `local:${version}`, ...(info.size === undefined ? {} : { size: Number(opened.size) }) },
+      close,
+      async check() { await verifyHandle(); await check() },
+      async read(offset, length) {
+        await verifyHandle()
+        // Preserve provider-specific read policy, even on a host-shared backend.
+        const bytes = await readWindow(fs, target, offset, length, signal)
+        const pinned = Buffer.allocUnsafe(length)
+        let total = 0
+        while (total < length) {
+          if (signal.aborted) throw new ReadFailure('FS_ABORTED')
+          const { bytesRead } = await handle.read(pinned, total, length - total, offset + total)
+          if (bytesRead === 0) break
+          total += bytesRead
+        }
+        await verifyHandle()
+        await check()
+        if (total !== bytes.byteLength || !pinned.subarray(0, total).equals(bytes)) throw new ReadFailure('FILE_CHANGED')
+        return bytes
+      },
+    }
+  } catch (error) {
+    await close()
+    throw error
+  }
+}
+
+/** Stream validated windows; completion, cancellation and errors share cleanup. */
+function bodyOf(reader, start, end, first, signal, cancel, log) {
   let offset = start
   let pending = first
+  let cancelled = false
+  let completed = false
+  let closing
+  const release = () => { closing ??= reader.close(); return closing }
   return new ReadableStream({
     async pull(controller) {
-      if (signal.aborted || offset >= end) {
-        controller.close()
-        return
-      }
-      let bytes
+      if (cancelled || completed) return
       try {
-        bytes = pending
+        if (signal.aborted || offset >= end) {
+          completed = true
+          await release()
+          if (!cancelled) controller.close()
+          return
+        }
+        let bytes = pending
         pending = undefined
-        if (bytes === undefined) {
-          bytes = await readWindow(fs, target, offset, Math.min(WINDOW, end - offset), signal)
+        if (bytes === undefined) bytes = await reader.read(offset, Math.min(WINDOW, end - offset))
+        await reader.check()
+        if (cancelled) return
+        if (signal.aborted) {
+          completed = true
+          await release()
+          if (!cancelled) controller.close()
+          return
         }
         if (bytes.byteLength === 0) {
-          controller.close()
+          if (offset < end && Number.isFinite(end)) throw new ReadFailure('FILE_CHANGED')
+          completed = true
+          await release()
+          if (!cancelled) controller.close()
           return
         }
-        // One response carries one version: a window that belongs to another
-        // version never enters the body, so the client cannot assemble a file
-        // out of two of them.
-        const current = await fs.stat(target, signal)
-        if (current === undefined || tagOf(current) !== expected) {
-          log?.warn(`file-download: ${target.displayPath} changed during download; response aborted`)
-          controller.error(new Error('file changed during download'))
-          return
+        offset += bytes.byteLength
+        controller.enqueue(bytes)
+        if (offset >= end) {
+          completed = true
+          await release()
+          if (!cancelled) controller.close()
         }
       } catch (error) {
-        if (signal.aborted) {
-          controller.close()
-          return
-        }
-        log?.warn(`file-download: read failed for ${target.displayPath}: ${error instanceof Error ? error.message : String(error)}`)
+        completed = true
+        try { await release() } catch (closeError) { log?.warn(`file-download: close failed: ${String(closeError)}`) }
+        if (cancelled) return
+        if (signal.aborted) { controller.close(); return }
+        log?.warn(`file-download: response aborted: ${error instanceof Error ? error.message : String(error)}`)
         controller.error(error)
-        return
       }
-      offset += bytes.byteLength
-      controller.enqueue(bytes)
+    },
+    async cancel(reason) {
+      cancelled = true
+      cancel.abort(reason)
+      await release()
     },
   })
 }
@@ -246,6 +347,7 @@ function bodyOf(fs, target, start, end, expected, first, signal, log) {
  */
 async function serve(request, fs, log) {
   const base = {
+    'X-DSH-File-Download': '1',
     'Cache-Control': 'private, no-store',
     'X-Content-Type-Options': 'nosniff',
     // Same defence in depth as the shipped route: these bytes are a download,
@@ -276,50 +378,53 @@ async function serve(request, fs, log) {
   if (info === undefined) return fail(404, 'not found')
   if (info.type !== 'file') return fail(403, 'not a regular file')
   const name = fileNameOf(path)
-  const size = info.size
-  const declared = typeof size === 'number' && Number.isFinite(size)
-  const etag = entityTag(info.version, declared ? size : undefined)
-  const headers = {
-    ...base,
-    'Content-Type': MEDIA_TYPES[extensionOf(name)] ?? 'application/octet-stream',
-    'Content-Disposition': contentDisposition(name),
-    // The validator a browser sends back as `If-Range` when it resumes: the same
-    // file version answers the range, a changed one restarts the download.
-    ETag: etag,
-  }
-  if (!declared) {
-    // A backend that cannot report a size gives no length and no ranges, so a
-    // browser cannot resume this response. Such backends are not the local one.
-    if (request.method === 'HEAD') return new Response(null, { headers })
-    const first = await readWindow(fs, target, 0, WINDOW, request.signal)
-    return new Response(bodyOf(fs, target, 0, Infinity, etag, first, request.signal, log), { headers })
-  }
-  headers['Accept-Ranges'] = 'bytes'
-  const range = rangeApplies(request.headers.get('if-range'), etag)
-    ? requestedRange(request.headers.get('range'), size)
-    : null
-  if (range === 'unsatisfiable') {
-    return new Response(null, { status: 416, headers: { ...headers, 'Content-Range': `bytes */${String(size)}` } })
-  }
-  const start = range === null ? 0 : range.start
-  const end = range === null ? size : range.end + 1
-  const status = range === null ? 200 : 206
-  const responseHeaders = {
-    ...headers,
-    'Content-Length': String(end - start),
-    ...(range === null ? {} : { 'Content-Range': `bytes ${String(start)}-${String(end - 1)}/${String(size)}` }),
-  }
-  if (request.method === 'HEAD' || end === start) return new Response(null, { status, headers: responseHeaders })
-  // Read the first window before any header goes out: a file that cannot be
-  // opened answers 403/404 here, instead of a 200 that dies mid-body.
-  let first
+  const cancel = new AbortController()
+  const signal = AbortSignal.any([request.signal, cancel.signal])
+  let reader
+  let streaming = false
   try {
-    first = await readWindow(fs, target, start, Math.min(WINDOW, end - start), request.signal)
+    reader = await openReader(fs, target, info, signal, log)
+    info = reader.info
+    const size = info.size
+    const declared = typeof size === 'number' && Number.isSafeInteger(size) && size >= 0
+    const etag = entityTag(info.version, declared ? size : undefined)
+    const headers = {
+      ...base,
+      'Content-Type': MEDIA_TYPES[extensionOf(name)] ?? 'application/octet-stream',
+      'Content-Disposition': contentDisposition(name),
+      ETag: etag,
+    }
+    let start = 0
+    let end = Infinity
+    let status = 200
+    if (declared) {
+      headers['Accept-Ranges'] = 'bytes'
+      const range = rangeApplies(request.headers.get('if-range'), etag)
+        ? requestedRange(request.headers.get('range'), size)
+        : null
+      if (range === 'unsatisfiable') {
+        return new Response(null, { status: 416, headers: { ...headers, 'Content-Range': `bytes */${String(size)}` } })
+      }
+      start = range === null ? 0 : range.start
+      end = range === null ? size : range.end + 1
+      status = range === null ? 200 : 206
+      headers['Content-Length'] = String(end - start)
+      if (range !== null) headers['Content-Range'] = `bytes ${String(start)}-${String(end - 1)}/${String(size)}`
+    }
+    if (request.method === 'HEAD' || end === start) return new Response(null, { status, headers })
+    // Both sized and unsized backends finish the first read and its validation
+    // before a successful Response can escape. Failures share one status mapper.
+    const first = await reader.read(start, Math.min(WINDOW, end - start))
+    if (first.byteLength === 0 && start < end && Number.isFinite(end)) throw new ReadFailure('FILE_CHANGED')
+    const response = new Response(bodyOf(reader, start, end, first, signal, cancel, log), { status, headers })
+    streaming = true
+    return response
   } catch (error) {
-    if (error instanceof ReadFailure) return fail(error.status, error.message)
-    throw error
+    const failure = readFailure(error)
+    return fail(failure.status, failure.message)
+  } finally {
+    if (!streaming) await reader?.close()
   }
-  return new Response(bodyOf(fs, target, start, end, etag, first, request.signal, log), { status, headers: responseHeaders })
 }
 
 export const inject = ['connection', 'fs']
