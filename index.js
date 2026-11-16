@@ -102,7 +102,8 @@ function extensionOf(name) {
  */
 function contentDisposition(name) {
   const fallback = name.replace(/[^\x20-\x7e]/gu, '_').replace(/["\\]/gu, '_')
-  return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(name)}`
+  const encoded = encodeURIComponent(name).replace(/['()*]/gu, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`
 }
 
 /**

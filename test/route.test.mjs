@@ -353,6 +353,15 @@ const settle = async (promise, ms = 3000) => Promise.race([
   }
 }
 
+// 18. RFC 5987 attr-char excludes apostrophes, parentheses and asterisks.
+{
+  const path = join(root, "O'Reilly(中文)*.pdf")
+  writeFileSync(path, 'pdf')
+  const response = await handlerWith(fakeFs()).fetch(request(path, { method: 'HEAD' }))
+  const value = response.headers.get('content-disposition')
+  check('filename*: special characters are percent-encoded', value?.includes("filename*=UTF-8''O%27Reilly%28%E4%B8%AD%E6%96%87%29%2A.pdf") === true, value)
+}
+
 rmSync(root, { recursive: true, force: true })
 console.log(failures.length === 0 ? `\nall host-route checks passed (${String(0)} failed)` : `\n${failures.length} failed: ${failures.join(', ')}`)
 process.exit(failures.length === 0 ? 0 : 1)
