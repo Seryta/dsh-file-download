@@ -50,7 +50,7 @@
 dsh plugin --profile <profile> add <本仓库绝对路径>
 ```
 
-也可使用 DSH Plugin Manager。替换已有宿主模块后，运行中的服务需要加载新模块，页面也需要刷新；修改仓库文件本身不表示运行态已经更新。
+也可使用 DSH Plugin Manager。启用宿主 `@deepseek-ai/dsh-hmr` 时，profile 重组会比较链接包的已加载文件并替换变化的宿主模块，**无需重启服务**；需要主动应用时，可通过 Plugin Manager 重新应用该已启用插件。应结合操作结果与下载路由探测确认生效，不能只看磁盘上的包版本。未启用 HMR，或操作明确返回 `restart-required` 时，再按其原因处理。客户端使用独立的模块加载机制，必要时刷新页面载入新代码。
 
 ## 反向代理
 
