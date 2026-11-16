@@ -345,6 +345,14 @@ const settle = async (promise, ms = 3000) => Promise.race([
   check('concurrent: both bodies correct', left === expected && right === md5(Buffer.from([1, 2, 3, 4])), `${left}/${right}`)
 }
 
+// 17. Empty suffix ranges must not manufacture a negative last-byte position.
+{
+  for (const method of ['GET', 'HEAD']) {
+    const response = await handlerWith(fakeFs()).fetch(request(emptyPath, { method, headers: { range: 'bytes=-1' } }))
+    check(`empty suffix ${method}: 416 with a valid Content-Range`, response.status === 416 && response.headers.get('content-range') === 'bytes */0', `${response.status}/${response.headers.get('content-range')}`)
+  }
+}
+
 rmSync(root, { recursive: true, force: true })
 console.log(failures.length === 0 ? `\nall host-route checks passed (${String(0)} failed)` : `\n${failures.length} failed: ${failures.join(', ')}`)
 process.exit(failures.length === 0 ? 0 : 1)

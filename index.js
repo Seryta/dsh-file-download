@@ -140,6 +140,7 @@ function requestedRange(header, size) {
   if (rawStart === '') {
     const length = Number(rawEnd)
     if (!Number.isSafeInteger(length) || length <= 0) return null
+    if (size === 0) return 'unsatisfiable'
     return { start: Math.max(0, size - length), end: size - 1 }
   }
   const start = Number(rawStart)
