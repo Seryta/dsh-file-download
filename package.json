@@ -1,6 +1,6 @@
 {
   "name": "dsh-file-download",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "在 DSH Web 的右侧预览面板里直接下载当前文件：标题栏按钮 + 空状态按钮，流式无上限、支持断点续传。",
   "type": "module",
   "main": "./index.js",
@@ -21,7 +21,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node test/route.test.mjs",
+    "test": "node test/route.test.mjs && node test/client.test.mjs",
     "test:mutation": "node scripts/mutation-check.mjs"
   },
   "license": "MIT",

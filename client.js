@@ -16,9 +16,10 @@
  * transfer. Nothing is read into page memory, there is no size cap, and mobile
  * browsers accept the navigation because no `await` runs first.
  *
- * The streaming route belongs to this bundle's Host half. A page that loaded
- * before it was mounted falls back to the shipped `/api/file` route, which
- * buffers and carries the Host image cap, rather than failing.
+ * The streaming route belongs to this bundle's Host half. Background capability
+ * probes keep unknown requests on that uncapped route; only a confirmed missing
+ * route falls back to the shipped, buffered `/api/file` route and its image cap.
+ * Desktop keeps its native file actions and does not apply these controls.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-file-download',
@@ -160,6 +161,7 @@ window.__ModuleLoader__.load({
 
     /** @param ctx - plugin-owned Client context. */
     function apply(ctx) {
+      if ('dshDesktop' in window) return
       ctx.effect(() => {
         const style = document.createElement('style')
         style.dataset.fileDownload = ''
@@ -171,15 +173,74 @@ window.__ModuleLoader__.load({
         child.effect(() => child.locale.register(NS, { zh, en }), 'file-download: locale')
         const t = child.locale.bind(NS)
         const notify = (text, success) => { child.contextMenus.notify(text, success) }
-        // Resolve the route once per page load, well before any click, so the
-        // click itself stays synchronous and keeps the browser's user gesture.
-        let route = LEGACY_ROUTE
+        // Probe outside the click so saving always preserves the user gesture.
+        // An unknown route prefers streaming: a transient failure must not impose
+        // the legacy image limit on a large file's first download.
+        let route = STREAM_ROUTE
         child.effect(() => {
+          const delays = [1000, 3000, 10000]
           let live = true
-          fetch(new URL(STREAM_ROUTE, document.baseURI), { method: 'HEAD', credentials: 'same-origin' })
-            .then((response) => { if (live && response.status !== 404) route = STREAM_ROUTE })
-            .catch(() => { /* keep the shipped route */ })
-          return () => { live = false }
+          let retries = 0
+          let controller
+          let retryTimer
+          let timeoutTimer
+          const retry = () => {
+            if (!live || retries >= delays.length) return
+            retryTimer = setTimeout(() => {
+              retryTimer = undefined
+              void probe()
+            }, delays[retries++])
+          }
+          async function probe() {
+            if (!live || controller !== undefined) return
+            const active = new AbortController()
+            controller = active
+            timeoutTimer = setTimeout(() => { active.abort() }, 5000)
+            try {
+              const response = await fetch(new URL(STREAM_ROUTE, document.baseURI), {
+                method: 'HEAD', credentials: 'same-origin', signal: active.signal,
+              })
+              if (!live) return
+              if (active.signal.aborted) {
+                retry()
+                return
+              }
+              const unavailable = response.status === 401 || response.status === 403 || response.status >= 500
+              if (!unavailable && response.headers.get('X-DSH-File-Download') === '1') {
+                route = STREAM_ROUTE
+              } else if (response.status === 404) {
+                route = LEGACY_ROUTE
+              } else {
+                route = STREAM_ROUTE
+                retry()
+              }
+            } catch (_error) {
+              if (!live) return
+              route = STREAM_ROUTE
+              retry()
+            } finally {
+              clearTimeout(timeoutTimer)
+              timeoutTimer = undefined
+              controller = undefined
+            }
+          }
+          const online = () => {
+            if (!live || controller !== undefined) return
+            clearTimeout(retryTimer)
+            retryTimer = undefined
+            retries = 0
+            route = STREAM_ROUTE
+            void probe()
+          }
+          window.addEventListener('online', online)
+          void probe()
+          return () => {
+            live = false
+            clearTimeout(retryTimer)
+            clearTimeout(timeoutTimer)
+            controller?.abort()
+            window.removeEventListener('online', online)
+          }
         }, 'file-download: route detection')
         const save = createSave(() => route, notify, t)
         const face = () => ({ save })
